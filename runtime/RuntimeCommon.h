@@ -142,11 +142,12 @@ SymExpr _sym_get_return_expression(void);
 void _sym_push_path_constraint(SymExpr constraint, int taken,
                                uintptr_t site_id);
 SymExpr _sym_get_input_byte(size_t offset);
+SymExpr _sym_get_input_length();
 
 /*
  * Memory management
  */
-SymExpr _sym_read_memory(uint8_t *addr, size_t length, bool little_endian);
+SymExpr _sym_read_memory(const uint8_t *addr, size_t length, bool little_endian);
 void _sym_write_memory(uint8_t *addr, size_t length, SymExpr expr,
                        bool little_endian);
 void _sym_memcpy(uint8_t *dest, const uint8_t *src, size_t length);
@@ -165,6 +166,7 @@ void _sym_notify_basic_block(uintptr_t site_id);
 /*
  * Debugging
  */
+const char *_sym_path_constraints_to_string();
 const char *_sym_expr_to_string(SymExpr expr); // statically allocated
 bool _sym_feasible(SymExpr expr);
 

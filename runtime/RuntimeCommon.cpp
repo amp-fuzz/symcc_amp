@@ -79,7 +79,7 @@ void _sym_memmove(uint8_t *dest, const uint8_t *src, size_t length) {
     std::copy(srcShadow.begin(), srcShadow.end(), destShadow.begin());
 }
 
-SymExpr _sym_read_memory(uint8_t *addr, size_t length, bool little_endian) {
+SymExpr _sym_read_memory(const uint8_t *addr, size_t length, bool little_endian) {
   assert(length && "Invalid query for zero-length memory region");
 
 #ifdef DEBUG_RUNTIME

@@ -115,10 +115,7 @@ void _sym_initialize(void) {
 
   loadConfig();
   initLibcWrappers();
-  std::cerr << "This is SymCC running with the simple backend" << std::endl
-            << "For anything but debugging SymCC itself, you will want to use "
-               "the QSYM backend instead (see README.md for build instructions)"
-            << std::endl;
+  std::cerr << "This is SymCC running with the simple backend" << std::endl;
 
   Z3_config cfg;
 
@@ -184,13 +181,22 @@ Z3_ast _sym_get_input_byte(size_t offset) {
   if (offset < stdinBytes.size())
     return stdinBytes[offset];
 
-  auto varName = "stdin" + std::to_string(stdinBytes.size());
+  auto varName = "pkt_in" + std::to_string(stdinBytes.size());
   auto *var = build_variable(varName.c_str(), 8);
 
   stdinBytes.resize(offset);
   stdinBytes.push_back(var);
 
   return var;
+}
+
+
+Z3_ast _sym_get_input_length() {
+  static SymExpr lengthExpr;
+  if(lengthExpr== nullptr) {
+      lengthExpr = build_variable("length_pkt_in", sizeof(ssize_t) * 8);
+  }
+  return lengthExpr;
 }
 
 Z3_ast _sym_build_null_pointer(void) { return g_null_pointer; }
@@ -442,6 +448,7 @@ void _sym_push_path_constraint(Z3_ast constraint, int taken,
       Z3_simplify(g_context, Z3_mk_not(g_context, constraint));
   Z3_inc_ref(g_context, not_constraint);
 
+  /* Skip computation of diverging inputs, we only need the path constraints
   Z3_solver_push(g_context, g_solver);
   Z3_solver_assert(g_context, g_solver, taken ? not_constraint : constraint);
   fprintf(g_log, "Trying to solve:\n%s\n",
@@ -460,6 +467,7 @@ void _sym_push_path_constraint(Z3_ast constraint, int taken,
   fflush(g_log);
 
   Z3_solver_pop(g_context, g_solver, 1);
+  */
 
   /* Assert the actual path constraint */
   Z3_ast newConstraint = (taken ? constraint : not_constraint);
@@ -494,7 +502,12 @@ void _sym_notify_ret(uintptr_t) {}
 void _sym_notify_basic_block(uintptr_t) {}
 
 /* Debugging */
+const char *_sym_path_constraints_to_string() {
+    return Z3_solver_to_string(g_context, g_solver);
+}
+
 const char *_sym_expr_to_string(SymExpr expr) {
+  expr = Z3_simplify(g_context, expr);
   return Z3_ast_to_string(g_context, expr);
 }
 

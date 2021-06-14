@@ -15,34 +15,30 @@
 #
 # The build stage
 #
-FROM ubuntu:20.04 AS builder
+FROM ubuntu:20.10 AS builder
 
 # Install dependencies
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y \
         cargo \
-        clang-10 \
+        clang-11 \
         cmake \
         g++ \
         git \
         libz3-dev \
-        llvm-10-dev \
-        llvm-10-tools \
+        llvm-11-dev \
+        llvm-11-tools \
         ninja-build \
         python2 \
         python3-pip \
         zlib1g-dev \
+        libsystemd-dev \
     && rm -rf /var/lib/apt/lists/*
 RUN pip3 install lit
 
-# Build AFL.
-RUN git clone -b v2.56b https://github.com/google/AFL.git afl \
-    && cd afl \
-    && make
-
 # Download the LLVM sources already so that we don't need to get them again when
 # SymCC changes
-RUN git clone -b llvmorg-10.0.1 --depth 1 https://github.com/llvm/llvm-project.git /llvm_source
+RUN git clone -b llvmorg-11.0.1 --depth 1 https://github.com/llvm/llvm-project.git /llvm_source
 
 # Build a version of SymCC with the simple backend to compile libc++
 COPY . /symcc_source
@@ -55,23 +51,12 @@ RUN if git submodule status | grep "^-">/dev/null ; then \
     git submodule update; \
     fi
 
-WORKDIR /symcc_build_simple
+WORKDIR /symcc_build
 RUN cmake -G Ninja \
-        -DQSYM_BACKEND=OFF \
         -DCMAKE_BUILD_TYPE=RelWithDebInfo \
         -DZ3_TRUST_SYSTEM_VERSION=on \
         /symcc_source \
     && ninja check
-
-# Build SymCC with the Qsym backend
-WORKDIR /symcc_build
-RUN cmake -G Ninja \
-        -DQSYM_BACKEND=ON \
-        -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-        -DZ3_TRUST_SYSTEM_VERSION=on \
-        /symcc_source \
-    && ninja check \
-    && cargo install --path /symcc_source/util/symcc_fuzzing_helper
 
 # Build libc++ with SymCC using the simple backend
 WORKDIR /libcxx_symcc
@@ -84,22 +69,22 @@ RUN export SYMCC_REGULAR_LIBCXX=yes SYMCC_NO_SYMBOLIC_INPUT=yes \
          -DLLVM_DISTRIBUTION_COMPONENTS="cxx;cxxabi;cxx-headers" \
          -DCMAKE_BUILD_TYPE=Release \
          -DCMAKE_INSTALL_PREFIX=/libcxx_symcc_install \
-         -DCMAKE_C_COMPILER=/symcc_build_simple/symcc \
-         -DCMAKE_CXX_COMPILER=/symcc_build_simple/sym++ \
+         -DCMAKE_C_COMPILER=/symcc_build/symcc \
+         -DCMAKE_CXX_COMPILER=/symcc_build/sym++ \
     && ninja distribution \
     && ninja install-distribution
 
 #
 # The final image
 #
-FROM ubuntu:20.04
+FROM ubuntu:20.10
 
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y \
         build-essential \
-        clang-10 \
+        clang-11 \
         g++ \
-        libllvm10 \
+        libllvm11 \
         zlib1g \
         sudo \
     && rm -rf /var/lib/apt/lists/* \
@@ -107,15 +92,10 @@ RUN apt-get update \
     && echo 'ubuntu ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/ubuntu
 
 COPY --from=builder /symcc_build /symcc_build
-COPY --from=builder /root/.cargo/bin/symcc_fuzzing_helper /symcc_build/
 COPY util/pure_concolic_execution.sh /symcc_build/
 COPY --from=builder /libcxx_symcc_install /libcxx_symcc_install
-COPY --from=builder /afl /afl
 
 ENV PATH /symcc_build:$PATH
-ENV AFL_PATH /afl
-ENV AFL_CC clang-10
-ENV AFL_CXX clang++-10
 ENV SYMCC_LIBCXX_PATH=/libcxx_symcc_install
 
 USER ubuntu
