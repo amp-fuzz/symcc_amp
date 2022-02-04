@@ -28,7 +28,11 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <sys/socket.h>
+#include <sys/select.h>
+#include <poll.h>
+#include <sys/epoll.h>
 #include <systemd/sd-daemon.h>
+#include <semaphore.h>
 
 #include "Config.h"
 #include "Shadow.h"
@@ -36,14 +40,21 @@
 
 #define SYM(x) x##_symbolized
 
+#define IS_LITTLE_ENDIAN (*reinterpret_cast<const uint16_t*>("\0\xff") > 0x0100)
+
 namespace {
 
+/// semaphore (if we have any)
+sem_t *listen_semaphore = nullptr;
+
+/// did we receive a symbolic input packet?
+bool packet_received = false;
 
 /// The current position in the (symbolic) input.
 uint64_t inputOffset = 0;
 
 /// Tell the solver to try an alternative value than the given one.
-template <typename V, typename F>
+template<typename V, typename F>
 void tryAlternative(V value, SymExpr valueExpr, F caller) {
   if (valueExpr) {
     _sym_push_path_constraint(
@@ -54,27 +65,37 @@ void tryAlternative(V value, SymExpr valueExpr, F caller) {
 }
 
 // A partial specialization for pointer types for convenience.
-template <typename E, typename F>
+template<typename E, typename F>
 void tryAlternative(E *value, SymExpr valueExpr, F caller) {
   tryAlternative(reinterpret_cast<intptr_t>(value), valueExpr, caller);
 }
 } // namespace
 
 void initLibcWrappers() {
+  auto *sem_name = getenv("SYMCC_LISTEN_SEM");
+  if (sem_name != nullptr) {
+    listen_semaphore = sem_open(sem_name, 0);
+  }
   if (g_config.fullyConcrete)
     return;
 }
 
-bool is_input_fd(int sockfd){
-    return sd_is_socket_inet(sockfd, AF_INET, SOCK_DGRAM, -1, g_config.inputPort);
+void listen_ready() {
+  if (listen_semaphore != nullptr) {
+    sem_post(listen_semaphore);
+  }
 }
 
-std::string hexdump(const void* data, size_t length){
-    std::ostringstream out("");
-    for(size_t i=0; i<length;i++){
-        out << std::hex << std::setw(2) << std::setfill('0') << unsigned(reinterpret_cast<const uint8_t*>(data)[i]);
-    }
-    return out.str();
+bool is_input_fd(int sockfd) {
+  return sd_is_socket_inet(sockfd, AF_INET, SOCK_DGRAM, -1, g_config.inputPort);
+}
+
+std::string hexdump(const void *data, size_t length) {
+  std::ostringstream out("");
+  for (size_t i = 0; i < length; i++) {
+    out << std::hex << std::setw(2) << std::setfill('0') << unsigned(reinterpret_cast<const uint8_t *>(data)[i]);
+  }
+  return out.str();
 }
 
 extern "C" {
@@ -156,7 +177,7 @@ ssize_t SYM(read)(int fildes, void *buf, size_t nbyte) {
 uint64_t SYM(lseek64)(int fd, uint64_t offset, int whence) {
   auto result = lseek64(fd, offset, whence);
   _sym_set_return_expression(nullptr);
-  if (result == (off_t)-1)
+  if (result == (off_t) - 1)
     return result;
 
   if (whence == SEEK_SET)
@@ -173,12 +194,12 @@ uint32_t SYM(lseek)(int fd, uint32_t offset, int whence) {
 
   // Perform the same overflow check as glibc in the 32-bit version of lseek.
 
-  auto result32 = (uint32_t)result;
+  auto result32 = (uint32_t) result;
   if (result == result32)
     return result32;
 
   errno = EOVERFLOW;
-  return (uint32_t)-1;
+  return (uint32_t) - 1;
 }
 
 size_t SYM(fread)(void *ptr, size_t size, size_t nmemb, FILE *stream) {
@@ -317,6 +338,10 @@ int SYM(fgetc)(FILE *stream) {
   return result;
 }
 
+int SYM(getchar)(void) {
+  return SYM(getc)(stdin);
+}
+
 int SYM(ungetc)(int c, FILE *stream) {
   auto result = ungetc(c, stream);
   _sym_set_return_expression(_sym_get_parameter_expression(0));
@@ -448,29 +473,29 @@ int SYM(memcmp)(const void *a, const void *b, size_t n) {
 }
 
 int SYM(bcmp)(const void *a, const void *b, size_t n) {
-    tryAlternative(a, _sym_get_parameter_expression(0), SYM(memcmp));
-    tryAlternative(b, _sym_get_parameter_expression(1), SYM(memcmp));
-    tryAlternative(n, _sym_get_parameter_expression(2), SYM(memcmp));
+  tryAlternative(a, _sym_get_parameter_expression(0), SYM(memcmp));
+  tryAlternative(b, _sym_get_parameter_expression(1), SYM(memcmp));
+  tryAlternative(n, _sym_get_parameter_expression(2), SYM(memcmp));
 
-    auto result = memcmp(a, b, n);
-    _sym_set_return_expression(nullptr);
+  auto result = memcmp(a, b, n);
+  _sym_set_return_expression(nullptr);
 
-    if (isConcrete(a, n) && isConcrete(b, n))
-        return result;
-
-    auto aShadowIt = ReadOnlyShadow(a, n).begin_non_null();
-    auto bShadowIt = ReadOnlyShadow(b, n).begin_non_null();
-    auto *allEqual = _sym_build_equal(*aShadowIt, *bShadowIt);
-    for (size_t i = 1; i < n; i++) {
-        ++aShadowIt;
-        ++bShadowIt;
-        allEqual =
-                _sym_build_bool_and(allEqual, _sym_build_equal(*aShadowIt, *bShadowIt));
-    }
-
-    _sym_push_path_constraint(allEqual, result == 0,
-                              reinterpret_cast<uintptr_t>(SYM(memcmp)));
+  if (isConcrete(a, n) && isConcrete(b, n))
     return result;
+
+  auto aShadowIt = ReadOnlyShadow(a, n).begin_non_null();
+  auto bShadowIt = ReadOnlyShadow(b, n).begin_non_null();
+  auto *allEqual = _sym_build_equal(*aShadowIt, *bShadowIt);
+  for (size_t i = 1; i < n; i++) {
+    ++aShadowIt;
+    ++bShadowIt;
+    allEqual =
+        _sym_build_bool_and(allEqual, _sym_build_equal(*aShadowIt, *bShadowIt));
+  }
+
+  _sym_push_path_constraint(allEqual, result == 0,
+                            reinterpret_cast<uintptr_t>(SYM(memcmp)));
+  return result;
 }
 
 uint32_t SYM(ntohl)(uint32_t netlong) {
@@ -494,216 +519,347 @@ uint32_t SYM(ntohl)(uint32_t netlong) {
 }
 
 uint16_t SYM(ntohs)(uint16_t netshort) {
-    auto netlongExpr = _sym_get_parameter_expression(0);
-    auto result = ntohs(netshort);
+  auto netlongExpr = _sym_get_parameter_expression(0);
+  auto result = ntohs(netshort);
 
-    if (netlongExpr == nullptr) {
-        _sym_set_return_expression(nullptr);
-        return result;
-    }
+  if (netlongExpr == nullptr) {
+    _sym_set_return_expression(nullptr);
+    return result;
+  }
 
 #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
-    _sym_set_return_expression(_sym_build_bswap(netlongExpr));
+  _sym_set_return_expression(_sym_build_bswap(netlongExpr));
 #elif __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
-    _sym_set_return_expression(netlongExpr);
+  _sym_set_return_expression(netlongExpr);
 #else
 #error Unsupported __BYTE_ORDER__
 #endif
 
-    return result;
+  return result;
 }
 
 uint32_t SYM(htonl)(uint32_t hostlong) {
-    auto netlongExpr = _sym_get_parameter_expression(0);
-    auto result = htonl(hostlong);
+  auto netlongExpr = _sym_get_parameter_expression(0);
+  auto result = htonl(hostlong);
 
-    if (netlongExpr == nullptr) {
-        _sym_set_return_expression(nullptr);
-        return result;
-    }
+  if (netlongExpr == nullptr) {
+    _sym_set_return_expression(nullptr);
+    return result;
+  }
 
 #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
-    _sym_set_return_expression(_sym_build_bswap(netlongExpr));
+  _sym_set_return_expression(_sym_build_bswap(netlongExpr));
 #elif __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
-    _sym_set_return_expression(netlongExpr);
+  _sym_set_return_expression(netlongExpr);
 #else
 #error Unsupported __BYTE_ORDER__
 #endif
 
-    return result;
+  return result;
 }
 
 uint16_t SYM(htons)(uint16_t hostshort) {
-    auto netlongExpr = _sym_get_parameter_expression(0);
-    auto result = htons(hostshort);
+  auto netlongExpr = _sym_get_parameter_expression(0);
+  auto result = htons(hostshort);
 
-    if (netlongExpr == nullptr) {
-        _sym_set_return_expression(nullptr);
-        return result;
-    }
+  if (netlongExpr == nullptr) {
+    _sym_set_return_expression(nullptr);
+    return result;
+  }
 
 #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
-    _sym_set_return_expression(_sym_build_bswap(netlongExpr));
+  _sym_set_return_expression(_sym_build_bswap(netlongExpr));
 #elif __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
-    _sym_set_return_expression(netlongExpr);
+  _sym_set_return_expression(netlongExpr);
 #else
 #error Unsupported __BYTE_ORDER__
 #endif
 
-    return result;
+  return result;
 }
 
-ssize_t SYM(send)(int socket, const void *message, size_t length, int flags){
-    std::cerr << "Path Assertions:\n" << _sym_path_constraints_to_string() << std::endl;
-    std::cerr << "Message bytes:\n";
-    for(size_t i=0; i<length; i++){
-        auto messageExpr = _sym_read_memory(&reinterpret_cast<const uint8_t*>(message)[i], 1, false);
-        if(messageExpr){
-            std::cerr << "SYM: " << _sym_expr_to_string(messageExpr) << "\n";
-        }else{
-            std::cerr << "CON: #x" << std::hex << std::setw(2) << std::setfill('0') << unsigned(reinterpret_cast<const uint8_t*>(message)[i]) << "\n";
-        }
-    }
-    std::cerr << std::endl;
-
-    // No symbolic sending -> result always concrete
-    auto result = send(socket, message, length, flags);
-    _sym_set_return_expression(nullptr);
-    return result;
-}
-
-ssize_t SYM(sendto)(int socket, const void *message, size_t length, int flags, const struct sockaddr *dest_addr, socklen_t dest_len){
-    std::cerr << "Path Assertions:\n" << _sym_path_constraints_to_string() << std::endl;
-    std::cerr << "Message bytes:\n";
-    for(size_t i=0; i<length; i++){
-        auto messageExpr = _sym_read_memory(&reinterpret_cast<const uint8_t*>(message)[i], 1, false);
-        if(messageExpr){
-            std::cerr << "SYM: " << _sym_expr_to_string(messageExpr) << "\n";
-        }else{
-            std::cerr << "CON: #x" << std::hex << std::setw(2) << std::setfill('0') << unsigned(reinterpret_cast<const uint8_t*>(message)[i]) << "\n";
-        }
-    }
-    std::cerr << std::endl;
-
-    // No symbolic sending -> result always concrete
-    auto result = sendto(socket, message, length, flags, dest_addr, dest_len);
-    _sym_set_return_expression(nullptr);
-    return result;
-}
-
-ssize_t SYM(sendmsg)(int socket, const struct msghdr *msg, int flags){
-    std::cerr << "Path Assertions:\n" << _sym_path_constraints_to_string() << std::endl;
-    std::cerr << "Message bytes:\n";
-    for(size_t i=0; i<msg->msg_iovlen; i++) {
-        const void *message = msg->msg_iov[i].iov_base;
-        size_t length = msg->msg_iov[i].iov_len;
-        for(size_t j=0; j<length; j++){
-            auto messageExpr = _sym_read_memory(&reinterpret_cast<const uint8_t*>(message)[j], 1, false);
-            if(messageExpr){
-                std::cerr << "SYM: " << _sym_expr_to_string(messageExpr) << "\n";
-            }else{
-                std::cerr << "CON: #x" << std::hex << std::setw(2) << std::setfill('0') << unsigned(reinterpret_cast<const uint8_t*>(message)[j]) << "\n";
-            }
-        }
-    }
-    std::cerr << std::endl;
-
-    // No symbolic sending -> result always concrete
-    auto result = sendmsg(socket, msg, flags);
-    _sym_set_return_expression(nullptr);
-    return result;
-}
-
-ssize_t SYM(sendmmsg)(int socket, struct mmsghdr *msgvec, unsigned int vlen, int flags){
-    std::cerr << "Path Assertions:\n" << _sym_path_constraints_to_string() << std::endl;
-    for(unsigned int j=0; j<vlen; j++) {
-        std::cerr << "Message bytes:\n";
-        auto msg = &msgvec[j].msg_hdr;
-        for (size_t i = 0; i < msg->msg_iovlen; i++) {
-            const void *message = msg->msg_iov[i].iov_base;
-            size_t length = msg->msg_iov[i].iov_len;
-            for(size_t k=0; k<length; k++){
-                auto messageExpr = _sym_read_memory(&reinterpret_cast<const uint8_t*>(message)[k], 1, false);
-                if(messageExpr){
-                    std::cerr << "SYM: " << _sym_expr_to_string(messageExpr) << "\n";
-                }else{
-                    std::cerr << "CON: #x" << std::hex << std::setw(2) << std::setfill('0') << unsigned(reinterpret_cast<const uint8_t*>(message)[k]) << "\n";
-                }
-            }
-        }
-        std::cerr << std::endl;
-    }
-
-    // No symbolic sending -> result always concrete
-    auto result = sendmmsg(socket, msgvec, vlen, flags);
-    _sym_set_return_expression(nullptr);
-    return result;
-}
-
-
-ssize_t SYM(recv)(int sockfd, void *buf, size_t len, int flags){
-    auto result = recv(sockfd, buf, len, flags);
-    _sym_set_return_expression(nullptr);
-
-
-    if (is_input_fd(sockfd)) {
-        _sym_set_return_expression(_sym_get_input_length());
-        // Reading symbolic input.
-        ReadWriteShadow shadow(buf, result);
-        std::generate(shadow.begin(), shadow.end(),
-                      []() { return _sym_get_input_byte(inputOffset++); });
-    } else if (!isConcrete(buf, result)) {
-        ReadWriteShadow shadow(buf, result);
-        std::fill(shadow.begin(), shadow.end(), nullptr);
-    }
-
-    return result;
-}
-
-ssize_t SYM(recvfrom)(int sockfd, void *buf, size_t len, int flags, struct sockaddr *src_addr, socklen_t *addrlen){
-    auto result = recvfrom(sockfd, buf, len, flags, src_addr, addrlen);
-    _sym_set_return_expression(nullptr);
-
-    if (is_input_fd(sockfd)) {
-        _sym_set_return_expression(_sym_get_input_length());
-        // Reading symbolic input.
-        ReadWriteShadow shadow(buf, result);
-        std::generate(shadow.begin(), shadow.end(),
-                      []() { return _sym_get_input_byte(inputOffset++); });
-    } else if (!isConcrete(buf, result)) {
-        ReadWriteShadow shadow(buf, result);
-        std::fill(shadow.begin(), shadow.end(), nullptr);
-    }
-
-    return result;
-}
-
-ssize_t SYM(recvmsg)(int sockfd, struct msghdr *msg, int flags){
-    auto result = recvmsg(sockfd, msg, flags);
-    _sym_set_return_expression(nullptr);
-
-    if (is_input_fd(sockfd)) {
-        _sym_set_return_expression(_sym_get_input_length());
-        size_t symbolized = 0;
-        for(size_t i=0; i<msg->msg_iovlen && static_cast<ssize_t>(symbolized) < result; i++, symbolized+=msg->msg_iov[i].iov_len) {
-            auto symbol_length = std::min(msg->msg_iov[i].iov_len, result-symbolized);
-            // Reading symbolic input.
-            ReadWriteShadow shadow(msg->msg_iov[i].iov_base, symbol_length);
-            std::generate(shadow.begin(), shadow.end(),
-                          []() { return _sym_get_input_byte(inputOffset++); });
-        }
+ssize_t SYM(send)(int socket, const void *message, size_t length, int flags) {
+  std::cerr << "Path Assertions:\n" << _sym_path_constraints_to_string() << std::endl;
+  std::cerr << "Message bytes:\n";
+  for (size_t i = 0; i < length; i++) {
+    auto messageExpr = _sym_read_memory(&reinterpret_cast<const uint8_t *>(message)[i], 1, false);
+    if (messageExpr) {
+      std::cerr << "SYM: " << _sym_expr_to_string(messageExpr) << "\n";
     } else {
-        size_t symbolized = 0;
-        for(size_t i=0; i<msg->msg_iovlen && static_cast<ssize_t>(symbolized) < result; i++, symbolized+=msg->msg_iov[i].iov_len) {
-            auto symbol_length = std::min(msg->msg_iov[i].iov_len, result-symbolized);
-            if (!isConcrete(msg->msg_iov[i].iov_base, symbol_length)) {
-                ReadWriteShadow shadow(msg->msg_iov[i].iov_base, symbol_length);
-                std::fill(shadow.begin(), shadow.end(), nullptr);
-            }
-        }
+      std::cerr << "CON: #x" << std::hex << std::setw(2) << std::setfill('0')
+                << unsigned(reinterpret_cast<const uint8_t *>(message)[i]) << "\n";
     }
+  }
+  std::cerr << std::endl;
 
-    return result;
+  // No symbolic sending -> result always concrete
+  auto result = send(socket, message, length, flags);
+  _sym_set_return_expression(nullptr);
+  return result;
+}
+
+ssize_t SYM(sendto)(int socket,
+                    const void *message,
+                    size_t length,
+                    int flags,
+                    const struct sockaddr *dest_addr,
+                    socklen_t dest_len) {
+  std::cerr << "Path Assertions:\n" << _sym_path_constraints_to_string() << std::endl;
+  std::cerr << "Message bytes:\n";
+  for (size_t i = 0; i < length; i++) {
+    auto messageExpr = _sym_read_memory(&reinterpret_cast<const uint8_t *>(message)[i], 1, false);
+    if (messageExpr) {
+      std::cerr << "SYM: " << _sym_expr_to_string(messageExpr) << "\n";
+    } else {
+      std::cerr << "CON: #x" << std::hex << std::setw(2) << std::setfill('0')
+                << unsigned(reinterpret_cast<const uint8_t *>(message)[i]) << "\n";
+    }
+  }
+  std::cerr << std::endl;
+
+  // No symbolic sending -> result always concrete
+  auto result = sendto(socket, message, length, flags, dest_addr, dest_len);
+  _sym_set_return_expression(nullptr);
+  return result;
+}
+
+ssize_t SYM(sendmsg)(int socket, const struct msghdr *msg, int flags) {
+  std::cerr << "Path Assertions:\n" << _sym_path_constraints_to_string() << std::endl;
+  std::cerr << "Message bytes:\n";
+  for (size_t i = 0; i < msg->msg_iovlen; i++) {
+    const void *message = msg->msg_iov[i].iov_base;
+    size_t length = msg->msg_iov[i].iov_len;
+    for (size_t j = 0; j < length; j++) {
+      auto messageExpr = _sym_read_memory(&reinterpret_cast<const uint8_t *>(message)[j], 1, false);
+      if (messageExpr) {
+        std::cerr << "SYM: " << _sym_expr_to_string(messageExpr) << "\n";
+      } else {
+        std::cerr << "CON: #x" << std::hex << std::setw(2) << std::setfill('0')
+                  << unsigned(reinterpret_cast<const uint8_t *>(message)[j]) << "\n";
+      }
+    }
+  }
+  std::cerr << std::endl;
+
+  // No symbolic sending -> result always concrete
+  auto result = sendmsg(socket, msg, flags);
+  _sym_set_return_expression(nullptr);
+  return result;
+}
+
+ssize_t SYM(sendmmsg)(int socket, struct mmsghdr *msgvec, unsigned int vlen, int flags) {
+  std::cerr << "Path Assertions:\n" << _sym_path_constraints_to_string() << std::endl;
+  for (unsigned int j = 0; j < vlen; j++) {
+    std::cerr << "Message bytes:\n";
+    auto msg = &msgvec[j].msg_hdr;
+    for (size_t i = 0; i < msg->msg_iovlen; i++) {
+      const void *message = msg->msg_iov[i].iov_base;
+      size_t length = msg->msg_iov[i].iov_len;
+      for (size_t k = 0; k < length; k++) {
+        auto messageExpr = _sym_read_memory(&reinterpret_cast<const uint8_t *>(message)[k], 1, false);
+        if (messageExpr) {
+          std::cerr << "SYM: " << _sym_expr_to_string(messageExpr) << "\n";
+        } else {
+          std::cerr << "CON: #x" << std::hex << std::setw(2) << std::setfill('0')
+                    << unsigned(reinterpret_cast<const uint8_t *>(message)[k]) << "\n";
+        }
+      }
+    }
+    std::cerr << std::endl;
+  }
+
+  // No symbolic sending -> result always concrete
+  auto result = sendmmsg(socket, msgvec, vlen, flags);
+  _sym_set_return_expression(nullptr);
+  return result;
+}
+
+ssize_t SYM(recv)(int sockfd, void *buf, size_t len, int flags) {
+  auto this_is_input_fd = is_input_fd(sockfd);
+  if (this_is_input_fd && !packet_received) {
+    listen_ready();
+  }
+  auto result = recv(sockfd, buf, len, flags);
+  _sym_set_return_expression(nullptr);
+
+  if (this_is_input_fd && !packet_received) {
+    _sym_set_return_expression(_sym_get_input_length());
+    // Reading symbolic input.
+    ReadWriteShadow shadow(buf, result);
+    std::generate(shadow.begin(), shadow.end(),
+                  []() { return _sym_get_input_byte(inputOffset++); });
+    packet_received = true;
+  } else if (!isConcrete(buf, result)) {
+    ReadWriteShadow shadow(buf, result);
+    std::fill(shadow.begin(), shadow.end(), nullptr);
+  }
+
+  return result;
+}
+
+ssize_t SYM(recvfrom)(int sockfd, void *buf, size_t len, int flags, struct sockaddr *src_addr, socklen_t *addrlen) {
+  auto this_is_input_fd = is_input_fd(sockfd);
+  if (this_is_input_fd && !packet_received) {
+    listen_ready();
+  }
+
+  auto result = recvfrom(sockfd, buf, len, flags, src_addr, addrlen);
+  _sym_set_return_expression(nullptr);
+
+  if (this_is_input_fd && !packet_received) {
+    _sym_set_return_expression(_sym_get_input_length());
+    // Reading symbolic input.
+    ReadWriteShadow shadow(buf, result);
+    std::generate(shadow.begin(), shadow.end(),
+                  []() { return _sym_get_input_byte(inputOffset++); });
+    packet_received = true;
+  } else if (!isConcrete(buf, result)) {
+    ReadWriteShadow shadow(buf, result);
+    std::fill(shadow.begin(), shadow.end(), nullptr);
+  }
+
+  return result;
+}
+
+ssize_t SYM(recvmsg)(int sockfd, struct msghdr *msg, int flags) {
+  auto this_is_input_fd = is_input_fd(sockfd);
+  if (this_is_input_fd && !packet_received) {
+    listen_ready();
+  }
+  auto result = recvmsg(sockfd, msg, flags);
+  _sym_set_return_expression(nullptr);
+
+  if (this_is_input_fd && !packet_received) {
+    _sym_set_return_expression(_sym_get_input_length());
+    size_t symbolized = 0;
+    for (size_t i = 0; i < msg->msg_iovlen && static_cast<ssize_t>(symbolized) < result;
+         i++, symbolized += msg->msg_iov[i].iov_len) {
+      auto symbol_length = std::min(msg->msg_iov[i].iov_len, result - symbolized);
+      // Reading symbolic input.
+      ReadWriteShadow shadow(msg->msg_iov[i].iov_base, symbol_length);
+      std::generate(shadow.begin(), shadow.end(),
+                    []() { return _sym_get_input_byte(inputOffset++); });
+      packet_received = true;
+    }
+  } else {
+    size_t unsymbolized = 0;
+    for (size_t i = 0; i < msg->msg_iovlen && static_cast<ssize_t>(unsymbolized) < result;
+         i++, unsymbolized += msg->msg_iov[i].iov_len) {
+      auto symbol_length = std::min(msg->msg_iov[i].iov_len, result - unsymbolized);
+      if (!isConcrete(msg->msg_iov[i].iov_base, symbol_length)) {
+        ReadWriteShadow shadow(msg->msg_iov[i].iov_base, symbol_length);
+        std::fill(shadow.begin(), shadow.end(), nullptr);
+      }
+    }
+  }
+
+  return result;
+}
+
+ssize_t SYM(recvmmsg)(int sockfd, struct mmsghdr *msgvec, unsigned int vlen, int flags, struct timespec *timeout) {
+  auto this_is_input_fd = is_input_fd(sockfd);
+  if (this_is_input_fd && !packet_received) {
+    listen_ready();
+  }
+  auto result = recvmmsg(sockfd, msgvec, vlen, flags, timeout);
+  _sym_set_return_expression(nullptr);
+
+  for (int j = 0; j < result; j++) {
+
+    mmsghdr *mmsghdr_ptr = &msgvec[j];
+    msghdr *msg = &mmsghdr_ptr->msg_hdr;
+    unsigned int *msglen = &mmsghdr_ptr->msg_len;
+
+    if (this_is_input_fd && !packet_received) {
+      _sym_write_memory(reinterpret_cast<uint8_t *>(msglen),
+                        sizeof(unsigned int),
+                        _sym_get_input_length(),
+                        IS_LITTLE_ENDIAN);
+      size_t symbolized = 0;
+      for (size_t i = 0; i < msg->msg_iovlen && static_cast<ssize_t>(symbolized) < result;
+           i++, symbolized += msg->msg_iov[i].iov_len) {
+        auto symbol_length = std::min(msg->msg_iov[i].iov_len, result - symbolized);
+        // Reading symbolic input.
+        ReadWriteShadow shadow(msg->msg_iov[i].iov_base, symbol_length);
+        std::generate(shadow.begin(), shadow.end(),
+                      []() { return _sym_get_input_byte(inputOffset++); });
+        packet_received = true;
+      }
+    } else {
+      if (!isConcrete(msglen, sizeof(unsigned int))) {
+        ReadWriteShadow len_shadow(msglen, sizeof(unsigned int));
+        std::fill(len_shadow.begin(), len_shadow.end(), nullptr);
+      }
+      size_t unsymbolized = 0;
+      for (size_t i = 0; i < msg->msg_iovlen && static_cast<ssize_t>(unsymbolized) < result;
+           i++, unsymbolized += msg->msg_iov[i].iov_len) {
+        auto symbol_length = std::min(msg->msg_iov[i].iov_len, result - unsymbolized);
+        if (!isConcrete(msg->msg_iov[i].iov_base, symbol_length)) {
+          ReadWriteShadow shadow(msg->msg_iov[i].iov_base, symbol_length);
+          std::fill(shadow.begin(), shadow.end(), nullptr);
+        }
+      }
+    }
+  }
+
+  return result;
+}
+
+// select
+int SYM(select)(int nfds, fd_set *readfds, fd_set *writefds, fd_set *errorfds, struct timeval *timeout) {
+  for (int i = 0; i < std::min(nfds, FD_SETSIZE); i++) {
+    if (FD_ISSET(i, readfds) && is_input_fd(i)) {
+      listen_ready();
+    }
+  }
+  return select(nfds, readfds, writefds, errorfds, timeout);
+}
+
+// pselect
+int SYM(pselect)(int nfds,
+                 fd_set *readfds,
+                 fd_set *writefds,
+                 fd_set *errorfds,
+                 const struct timespec *timeout,
+                 const sigset_t *sigmask) {
+  for (int i = 0; i < std::min(nfds, FD_SETSIZE); i++) {
+    if (FD_ISSET(i, readfds) && is_input_fd(i)) {
+      listen_ready();
+    }
+  }
+  return pselect(nfds, readfds, writefds, errorfds, timeout, sigmask);
+}
+
+// poll
+int SYM(poll)(struct pollfd *fds, nfds_t nfds, int timeout) {
+  for (nfds_t i = 0; i < nfds; i++) {
+    if (is_input_fd(fds[i].fd) && (fds[i].events & (POLLIN | POLLRDNORM | POLLRDBAND | POLLPRI)) != 0) {
+      listen_ready();
+    }
+  }
+  return poll(fds, nfds, timeout);
+}
+
+// ppoll
+int SYM(ppoll)(struct pollfd *fds, nfds_t nfds, const struct timespec *tmo_p, const sigset_t *sigmask) {
+  for (nfds_t i = 0; i < nfds; i++) {
+    if (is_input_fd(fds[i].fd) && (fds[i].events & (POLLIN | POLLRDNORM | POLLRDBAND | POLLPRI)) != 0) {
+      listen_ready();
+    }
+  }
+  return ppoll(fds, nfds, tmo_p, sigmask);
+}
+
+// epoll_wait
+int SYM(epoll_wait)(int epfd, struct epoll_event *events, int maxevents, int timeout) {
+  listen_ready();
+  return epoll_wait(epfd, events, maxevents, timeout);
+}
+
+// epoll_pwait
+int SYM(epoll_pwait)(int epfd, struct epoll_event *events, int maxevents, int timeout, const sigset_t *sigmask) {
+  listen_ready();
+  return epoll_pwait(epfd, events, maxevents, timeout, sigmask);
 }
 
 }

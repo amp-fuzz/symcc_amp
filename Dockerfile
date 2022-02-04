@@ -13,7 +13,7 @@
 # SymCC. If not, see <https://www.gnu.org/licenses/>.
 
 #
-# The build stage
+# The base image
 #
 FROM ubuntu:20.10 AS builder
 
@@ -51,6 +51,11 @@ RUN if git submodule status | grep "^-">/dev/null ; then \
     git submodule update; \
     fi
 
+
+#
+# Build SymCC with the simple backend
+#
+FROM builder AS builder_simple
 WORKDIR /symcc_build
 RUN cmake -G Ninja \
         -DCMAKE_BUILD_TYPE=RelWithDebInfo \
@@ -58,21 +63,24 @@ RUN cmake -G Ninja \
         /symcc_source \
     && ninja check
 
+#
 # Build libc++ with SymCC using the simple backend
+#
+FROM builder_simple AS builder_libcxx
 WORKDIR /libcxx_symcc
 RUN export SYMCC_REGULAR_LIBCXX=yes SYMCC_NO_SYMBOLIC_INPUT=yes \
-    && mkdir /libcxx_symcc_build \
-    && cd /libcxx_symcc_build \
-    && cmake -G Ninja /llvm_source/llvm \
-         -DLLVM_ENABLE_PROJECTS="libcxx;libcxxabi" \
-         -DLLVM_TARGETS_TO_BUILD="X86" \
-         -DLLVM_DISTRIBUTION_COMPONENTS="cxx;cxxabi;cxx-headers" \
-         -DCMAKE_BUILD_TYPE=Release \
-         -DCMAKE_INSTALL_PREFIX=/libcxx_symcc_install \
-         -DCMAKE_C_COMPILER=/symcc_build/symcc \
-         -DCMAKE_CXX_COMPILER=/symcc_build/sym++ \
-    && ninja distribution \
-    && ninja install-distribution
+  && mkdir /libcxx_symcc_build \
+  && cd /libcxx_symcc_build \
+  && cmake -G Ninja /llvm_source/llvm \
+  -DLLVM_ENABLE_PROJECTS="libcxx;libcxxabi" \
+  -DLLVM_TARGETS_TO_BUILD="X86" \
+  -DLLVM_DISTRIBUTION_COMPONENTS="cxx;cxxabi;cxx-headers" \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_INSTALL_PREFIX=/libcxx_symcc_install \
+  -DCMAKE_C_COMPILER=/symcc_build/symcc \
+  -DCMAKE_CXX_COMPILER=/symcc_build/sym++ \
+  && ninja distribution \
+  && ninja install-distribution
 
 #
 # The final image
@@ -91,9 +99,11 @@ RUN apt-get update \
     && useradd -m -s /bin/bash ubuntu \
     && echo 'ubuntu ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/ubuntu
 
-COPY --from=builder /symcc_build /symcc_build
+COPY --from=builder_simple /symcc_build /symcc_build
+COPY --from=builder_simple /root/.cargo/bin/symcc_fuzzing_helper /symcc_build/
 COPY util/pure_concolic_execution.sh /symcc_build/
-COPY --from=builder /libcxx_symcc_install /libcxx_symcc_install
+COPY --from=builder_libcxx /libcxx_symcc_install /libcxx_symcc_install
+
 
 ENV PATH /symcc_build:$PATH
 ENV SYMCC_LIBCXX_PATH=/libcxx_symcc_install

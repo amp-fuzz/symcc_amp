@@ -1,3 +1,5 @@
+[![Compile and test SymCC](https://github.com/eurecom-s3/symcc/actions/workflows/run_tests.yml/badge.svg)](https://github.com/eurecom-s3/symcc/actions/workflows/run_tests.yml)
+
 # SymCC: efficient compiler-based symbolic execution
 
 SymCC is a compiler wrapper which embeds symbolic execution into the program
@@ -103,7 +105,7 @@ program reads from standard input is treated as symbolic; alternatively, you can
 set the environment variable SYMCC_INPUT_FILE to the name of a file whose
 contents will be treated as symbolic when read.
 
-Note that due how the QSYM backend is implemented, all input has to be available
+Note that due to how the QSYM backend is implemented, all input has to be available
 from the start. In particular, when providing symbolic data on standard input
 interactively, you need to terminate your input by pressing Ctrl+D before the
 program starts to execute.
